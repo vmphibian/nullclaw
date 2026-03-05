@@ -27,7 +27,11 @@ const CancelWatcherCtx = struct {
 fn cancelWatcherMain(ctx: *CancelWatcherCtx) void {
     while (!ctx.done.load(.acquire)) {
         if (ctx.cancel_flag.load(.acquire)) {
-            _ = ctx.child.kill() catch {};
+            if (comptime @import("builtin").os.tag == .windows) {
+                std.os.windows.TerminateProcess(ctx.child.id, 1) catch {};
+            } else {
+                std.posix.kill(ctx.child.id, std.posix.SIG.TERM) catch {};
+            }
             break;
         }
         std.Thread.sleep(20 * std.time.ns_per_ms);

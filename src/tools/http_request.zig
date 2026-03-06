@@ -202,6 +202,7 @@ fn runCurlRequestWithStatus(
 ) !http_util.HttpResponse {
     var argv_buf: [64][]const u8 = undefined;
     var argc: usize = 0;
+    const reserved_tail_args: usize = if (body != null) 5 else 3;
 
     argv_buf[argc] = "curl";
     argc += 1;
@@ -233,7 +234,9 @@ fn runCurlRequestWithStatus(
     }
 
     for (headers) |h| {
-        if (argc + 2 > argv_buf.len) break;
+        // Reserve room for trailing args:
+        // -w "\n%{http_code}" <url> and optional --data-binary @-
+        if (argc + 2 + reserved_tail_args > argv_buf.len) break;
         const line = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ h[0], h[1] });
         try header_lines.append(allocator, line);
         argv_buf[argc] = "-H";
@@ -243,12 +246,14 @@ fn runCurlRequestWithStatus(
     }
 
     if (body != null) {
+        if (argc + 2 + 3 > argv_buf.len) return error.CurlArgsOverflow;
         argv_buf[argc] = "--data-binary";
         argc += 1;
         argv_buf[argc] = "@-";
         argc += 1;
     }
 
+    if (argc + 3 > argv_buf.len) return error.CurlArgsOverflow;
     argv_buf[argc] = "-w";
     argc += 1;
     argv_buf[argc] = "\n%{http_code}";

@@ -24,6 +24,7 @@ const AI_INTERACTION_PREPARE_URL = "https://api.dingtalk.com/v1.0/aiInteraction/
 const AI_INTERACTION_UPDATE_URL = "https://api.dingtalk.com/v1.0/aiInteraction/update";
 const AI_INTERACTION_FINISH_URL = "https://api.dingtalk.com/v1.0/aiInteraction/finish";
 const CALLBACK_TOPIC = "/v1.0/im/bot/messages/get";
+const SYSTEM_TOPIC_DISCONNECT = "disconnect";
 const USER_AGENT = "nullclaw-dingtalk/0.1.0";
 const TOKEN_REFRESH_MARGIN_SECS: i64 = 300;
 const RECONNECT_DELAY_NS: u64 = 5 * std.time.ns_per_s;
@@ -391,6 +392,12 @@ fn build_success_response_json(allocator: std.mem.Allocator, message: []const u8
 
 fn build_response_null_json(allocator: std.mem.Allocator) ![]u8 {
     return allocator.dupe(u8, "{\"response\":null}");
+}
+
+fn should_ack_system_topic(topic: []const u8) bool {
+    // DingTalk disconnect notifications are advisory; the server closes the
+    // socket after a short grace period and expects no ACK from the client.
+    return !std.mem.eql(u8, topic, SYSTEM_TOPIC_DISCONNECT);
 }
 
 fn trim_prefix_ignore_case(text: []const u8, prefix: []const u8) ?[]const u8 {
@@ -1351,10 +1358,11 @@ pub const DingTalkChannel = struct {
         const data_json = json_string_from_obj(parsed.value, "data") orelse "{}";
 
         if (std.mem.eql(u8, envelope_type, "SYSTEM")) {
+            if (!should_ack_system_topic(topic)) return true;
             const ack = try build_ack_json(self.allocator, 200, message_id, "OK", data_json);
             defer self.allocator.free(ack);
             try ws.writeText(ack);
-            return std.mem.eql(u8, topic, "disconnect");
+            return false;
         }
 
         if (std.mem.eql(u8, envelope_type, "CALLBACK")) {
@@ -1503,7 +1511,7 @@ pub const DingTalkChannel = struct {
         self.running.store(true, .release);
         self.connected.store(false, .release);
         self.ws_thread = std.Thread.spawn(
-            .{ .stack_size = thread_stacks.CONTROL_LOOP_STACK_SIZE },
+            .{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE },
             websocketLoop,
             .{self},
         ) catch |err| {
@@ -1627,6 +1635,11 @@ test "build_ack_json includes message id and escaped data" {
     try std.testing.expect(std.mem.indexOf(u8, ack, "\"messageId\":\"mid-1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ack, "\"code\":200") != null);
     try std.testing.expect(std.mem.indexOf(u8, ack, "\\\"response\\\":\\\"ok\\\"") != null);
+}
+
+test "should_ack_system_topic skips disconnect" {
+    try std.testing.expect(should_ack_system_topic("ping"));
+    try std.testing.expect(!should_ack_system_topic(SYSTEM_TOPIC_DISCONNECT));
 }
 
 test "build_basic_card_schema_content trims outer whitespace and embeds text content" {

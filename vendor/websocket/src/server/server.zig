@@ -1543,13 +1543,24 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
     }
 
     const n = socketRead(hc.socket, buf[len..]) catch |err| {
-        switch (err) {
-            error.BrokenPipe, error.ConnectionResetByPeer => log.debug("({f}) handshake connection closed: {}", .{ conn.address, err }),
-            error.WouldBlock => {
-                std.debug.assert(blockingMode());
-                log.debug("({f}) handshake timeout", .{conn.address});
-            },
-            else => log.warn("({f}) handshake error reading from socket: {}", .{ conn.address, err }),
+        if (comptime builtin.os.tag == .windows) {
+            switch (err) {
+                error.ConnectionResetByPeer => log.debug("({f}) handshake connection closed: {}", .{ conn.address, err }),
+                error.WouldBlock => {
+                    std.debug.assert(blockingMode());
+                    log.debug("({f}) handshake timeout", .{conn.address});
+                },
+                else => log.warn("({f}) handshake error reading from socket: {}", .{ conn.address, err }),
+            }
+        } else {
+            switch (err) {
+                error.BrokenPipe, error.ConnectionResetByPeer => log.debug("({f}) handshake connection closed: {}", .{ conn.address, err }),
+                error.WouldBlock => {
+                    std.debug.assert(blockingMode());
+                    log.debug("({f}) handshake timeout", .{conn.address});
+                },
+                else => log.warn("({f}) handshake error reading from socket: {}", .{ conn.address, err }),
+            }
         }
         return .{ false, false };
     };

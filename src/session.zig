@@ -2066,51 +2066,99 @@ test "processMessage runtime slash commands persist across reload" {
     defer sm.deinit();
 
     const session_key = "telegram:main:runtime-state";
-    const think_reply = try sm.processMessage(session_key, "/think high", .{
-        .channel = "telegram",
-        .is_group = false,
-        .group_id = null,
-    });
-    defer testing.allocator.free(think_reply);
+    const commands = [_][]const u8{
+        "/think high",
+        "/verbose full",
+        "/reasoning stream",
+        "/usage full",
+        "/exec host=node security=full ask=always node=worker-a",
+        "/queue debounce debounce:2s cap:3 drop:oldest",
+        "/tts always provider test-provider limit 120 summary on audio on",
+        "/session ttl 5m",
+        "/focus incident-123",
+        "/dock-telegram",
+        "/activation always",
+        "/send on",
+        "/debug reset",
+        "/usage cost",
+        "/exec host=sandbox security=allowlist ask=on-miss",
+        "/queue serial cap:4 drop:newest",
+        "/tts tagged provider replay-provider limit 77 summary off audio off",
+        "/session ttl 30s",
+        "/unfocus",
+        "/dock-slack",
+        "/activation mention",
+        "/send inherit",
+        "/elevated full",
+    };
 
-    const verbose_reply = try sm.processMessage(session_key, "/verbose full", .{
-        .channel = "telegram",
-        .is_group = false,
-        .group_id = null,
-    });
-    defer testing.allocator.free(verbose_reply);
-
-    const reasoning_reply = try sm.processMessage(session_key, "/reasoning stream", .{
-        .channel = "telegram",
-        .is_group = false,
-        .group_id = null,
-    });
-    defer testing.allocator.free(reasoning_reply);
+    for (commands) |command| {
+        const reply = try sm.processMessage(session_key, command, .{
+            .channel = "telegram",
+            .is_group = false,
+            .group_id = null,
+        });
+        defer testing.allocator.free(reply);
+    }
 
     const live_session = try sm.getOrCreate(session_key);
-    try testing.expectEqualStrings("high", live_session.agent.reasoning_effort.?);
-    try testing.expect(live_session.agent.verbose_level == .full);
-    try testing.expect(live_session.agent.reasoning_mode == .stream);
+    try testing.expect(live_session.agent.reasoning_effort == null);
+    try testing.expect(live_session.agent.verbose_level == .off);
+    try testing.expect(live_session.agent.reasoning_mode == .off);
+    try testing.expect(live_session.agent.usage_mode == .cost);
+    try testing.expect(live_session.agent.exec_host == .sandbox);
+    try testing.expect(live_session.agent.exec_security == .full);
+    try testing.expect(live_session.agent.exec_ask == .off);
+    try testing.expect(live_session.agent.exec_node_id == null);
+    try testing.expect(live_session.agent.queue_mode == .serial);
+    try testing.expectEqual(@as(u32, 4), live_session.agent.queue_cap);
+    try testing.expect(live_session.agent.queue_drop == .newest);
+    try testing.expect(live_session.agent.tts_mode == .tagged);
+    try testing.expectEqualStrings("replay-provider", live_session.agent.tts_provider.?);
+    try testing.expectEqual(@as(u32, 77), live_session.agent.tts_limit_chars);
+    try testing.expect(!live_session.agent.tts_summary);
+    try testing.expect(!live_session.agent.tts_audio);
+    try testing.expectEqual(@as(?u64, 30), live_session.agent.session_ttl_secs);
+    try testing.expect(live_session.agent.focus_target == null);
+    try testing.expectEqualStrings("slack", live_session.agent.dock_target.?);
+    try testing.expect(live_session.agent.activation_mode == .mention);
+    try testing.expect(live_session.agent.send_mode == .inherit);
     try testing.expectEqual(@as(usize, 0), live_session.agent.historyLen());
 
     const store = sqlite_mem.sessionStore();
     const entries = try store.loadMessages(testing.allocator, session_key);
     defer memory_mod.freeMessages(testing.allocator, entries);
-    try testing.expectEqual(@as(usize, 3), entries.len);
-    try testing.expectEqualStrings(RUNTIME_COMMAND_ROLE, entries[0].role);
-    try testing.expectEqualStrings("/think high", entries[0].content);
-    try testing.expectEqualStrings(RUNTIME_COMMAND_ROLE, entries[1].role);
-    try testing.expectEqualStrings("/verbose full", entries[1].content);
-    try testing.expectEqualStrings(RUNTIME_COMMAND_ROLE, entries[2].role);
-    try testing.expectEqualStrings("/reasoning stream", entries[2].content);
+    try testing.expectEqual(@as(usize, commands.len), entries.len);
+    for (entries, commands) |entry, command| {
+        try testing.expectEqualStrings(RUNTIME_COMMAND_ROLE, entry.role);
+        try testing.expectEqualStrings(command, entry.content);
+    }
 
     live_session.last_active = 0;
     try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
 
     const restored = try sm.getOrCreate(session_key);
-    try testing.expectEqualStrings("high", restored.agent.reasoning_effort.?);
-    try testing.expect(restored.agent.verbose_level == .full);
-    try testing.expect(restored.agent.reasoning_mode == .stream);
+    try testing.expect(restored.agent.reasoning_effort == null);
+    try testing.expect(restored.agent.verbose_level == .off);
+    try testing.expect(restored.agent.reasoning_mode == .off);
+    try testing.expect(restored.agent.usage_mode == .cost);
+    try testing.expect(restored.agent.exec_host == .sandbox);
+    try testing.expect(restored.agent.exec_security == .full);
+    try testing.expect(restored.agent.exec_ask == .off);
+    try testing.expect(restored.agent.exec_node_id == null);
+    try testing.expect(restored.agent.queue_mode == .serial);
+    try testing.expectEqual(@as(u32, 4), restored.agent.queue_cap);
+    try testing.expect(restored.agent.queue_drop == .newest);
+    try testing.expect(restored.agent.tts_mode == .tagged);
+    try testing.expectEqualStrings("replay-provider", restored.agent.tts_provider.?);
+    try testing.expectEqual(@as(u32, 77), restored.agent.tts_limit_chars);
+    try testing.expect(!restored.agent.tts_summary);
+    try testing.expect(!restored.agent.tts_audio);
+    try testing.expectEqual(@as(?u64, 30), restored.agent.session_ttl_secs);
+    try testing.expect(restored.agent.focus_target == null);
+    try testing.expectEqualStrings("slack", restored.agent.dock_target.?);
+    try testing.expect(restored.agent.activation_mode == .mention);
+    try testing.expect(restored.agent.send_mode == .inherit);
     try testing.expectEqual(@as(usize, 0), restored.agent.historyLen());
 }
 

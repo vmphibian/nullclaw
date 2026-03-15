@@ -587,6 +587,48 @@ pub const OpenAiCompatibleProvider = struct {
         ctx.state.feed(chunk.delta, ctx.downstream, ctx.downstream_ctx);
     }
 
+    fn extractMessageText(allocator: std.mem.Allocator, msg_obj: std.json.ObjectMap) !?[]const u8 {
+        const content = msg_obj.get("content") orelse return null;
+
+        switch (content) {
+            .string => {
+                const trimmed = std.mem.trim(u8, content.string, " \t\n\r");
+                if (trimmed.len == 0) return null;
+                return try stripThinkBlocks(allocator, trimmed);
+            },
+            .array => {
+                var text_parts: std.ArrayListUnmanaged(u8) = .empty;
+                defer text_parts.deinit(allocator);
+
+                for (content.array.items) |part| {
+                    var candidate: ?[]const u8 = null;
+                    switch (part) {
+                        .string => candidate = part.string,
+                        .object => {
+                            if (part.object.get("text")) |text| {
+                                if (text == .string) candidate = text.string;
+                            }
+                        },
+                        else => {},
+                    }
+
+                    if (candidate) |text_value| {
+                        const trimmed = std.mem.trim(u8, text_value, " \t\n\r");
+                        if (trimmed.len == 0) continue;
+                        if (text_parts.items.len > 0) try text_parts.append(allocator, '\n');
+                        try text_parts.appendSlice(allocator, trimmed);
+                    }
+                }
+
+                if (text_parts.items.len == 0) return null;
+                const joined = try text_parts.toOwnedSlice(allocator);
+                defer allocator.free(joined);
+                return try stripThinkBlocks(allocator, joined);
+            },
+            else => return null,
+        }
+    }
+
     /// Parse text content from an OpenAI-compatible response.
     pub fn parseTextResponse(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -606,9 +648,23 @@ pub const OpenAiCompatibleProvider = struct {
         if (root_obj.get("choices")) |choices| {
             if (choices.array.items.len > 0) {
                 if (choices.array.items[0].object.get("message")) |msg| {
-                    if (msg.object.get("content")) |content| {
-                        if (content == .string) {
-                            return stripThinkBlocks(allocator, content.string);
+                    const msg_obj = msg.object;
+
+                    if (try extractMessageText(allocator, msg_obj)) |text| {
+                        return text;
+                    }
+
+                    if (msg_obj.get("reasoning_content")) |reasoning| {
+                        if (reasoning == .string) {
+                            const trimmed = std.mem.trim(u8, reasoning.string, " \t\n\r");
+                            if (trimmed.len > 0) return stripThinkBlocks(allocator, trimmed);
+                        }
+                    }
+
+                    if (msg_obj.get("reasoning")) |reasoning| {
+                        if (reasoning == .string) {
+                            const trimmed = std.mem.trim(u8, reasoning.string, " \t\n\r");
+                            if (trimmed.len > 0) return stripThinkBlocks(allocator, trimmed);
                         }
                     }
                 }
@@ -1542,6 +1598,24 @@ test "parseTextResponse with null content fails" {
         \\{"choices":[{"message":{"content":null}}]}
     ;
     try std.testing.expectError(error.NoResponseContent, OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body));
+}
+
+test "parseTextResponse falls back to reasoning_content when content is null" {
+    const body =
+        \\{"choices":[{"message":{"content":null,"reasoning_content":"I can still answer"}}]}
+    ;
+    const result = try OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("I can still answer", result);
+}
+
+test "parseTextResponse supports content array text parts" {
+    const body =
+        \\{"choices":[{"message":{"content":[{"type":"text","text":"Hello"},{"type":"text","text":"from kimi-k2.5"}]}}]}
+    ;
+    const result = try OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("Hello\nfrom kimi-k2.5", result);
 }
 
 test "AuthStyle headerName" {

@@ -216,10 +216,11 @@ fn deinitDraftMessages(allocator: Allocator, draft_messages: *DraftMessageMap) v
 }
 
 fn draftMessageKey(allocator: Allocator, msg: bus.OutboundMessage) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}", .{
+    return std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{d}", .{
         msg.channel,
         msg.account_id orelse "",
         msg.chat_id,
+        msg.draft_id,
     });
 }
 
@@ -258,7 +259,10 @@ fn dispatchOutboundMessage(
     msg: bus.OutboundMessage,
     draft_messages: *DraftMessageMap,
 ) !void {
-    if (!channel.supportsStreamingOutbound() and supportsDraftStreaming(channel)) {
+    if (msg.draft_id != 0 and
+        !channel.supportsStreamingOutbound() and
+        supportsDraftStreaming(channel))
+    {
         switch (msg.stage) {
             .chunk => return dispatchDraftChunk(allocator, channel, msg, draft_messages),
             .final => {
@@ -282,7 +286,13 @@ fn dispatchDraftChunk(
     try state.buffer.appendSlice(allocator, msg.content);
 
     if (state.message_ref == null) {
-        state.message_ref = (try channel.sendTracked(msg.chat_id, state.buffer.items)) orelse return error.InvalidMessageRef;
+        state.message_ref = (channel.sendTracked(msg.chat_id, state.buffer.items) catch |err| {
+            removeDraftState(allocator, draft_messages, state.key);
+            return err;
+        }) orelse {
+            removeDraftState(allocator, draft_messages, state.key);
+            return error.InvalidMessageRef;
+        };
         return;
     }
 
@@ -856,8 +866,13 @@ test "dispatcher tracks chunk drafts via sendTracked and editMessage" {
     var event_bus = bus.Bus.init();
     var stats = DispatchStats{};
 
-    try event_bus.publishOutbound(try bus.makeOutboundChunk(allocator, "external", "chat1", "Hel"));
-    try event_bus.publishOutbound(try bus.makeOutboundChunk(allocator, "external", "chat1", "lo"));
+    var first_chunk = try bus.makeOutboundChunk(allocator, "external", "chat1", "Hel");
+    first_chunk.draft_id = 1;
+    try event_bus.publishOutbound(first_chunk);
+
+    var second_chunk = try bus.makeOutboundChunk(allocator, "external", "chat1", "lo");
+    second_chunk.draft_id = 1;
+    try event_bus.publishOutbound(second_chunk);
     event_bus.close();
 
     runOutboundDispatcher(allocator, &event_bus, &reg, &stats);
@@ -887,8 +902,13 @@ test "dispatcher deletes tracked draft on empty final" {
     var event_bus = bus.Bus.init();
     var stats = DispatchStats{};
 
-    try event_bus.publishOutbound(try bus.makeOutboundChunk(allocator, "external", "chat1", "Hello"));
-    try event_bus.publishOutbound(try bus.makeOutbound(allocator, "external", "chat1", ""));
+    var chunk = try bus.makeOutboundChunk(allocator, "external", "chat1", "Hello");
+    chunk.draft_id = 2;
+    try event_bus.publishOutbound(chunk);
+
+    var final = try bus.makeOutbound(allocator, "external", "chat1", "");
+    final.draft_id = 2;
+    try event_bus.publishOutbound(final);
     event_bus.close();
 
     runOutboundDispatcher(allocator, &event_bus, &reg, &stats);
@@ -916,8 +936,13 @@ test "dispatcher falls back to plain final send after deleting tracked draft for
     var event_bus = bus.Bus.init();
     var stats = DispatchStats{};
 
-    try event_bus.publishOutbound(try bus.makeOutboundChunk(allocator, "external", "chat1", "Hello"));
-    try event_bus.publishOutbound(try bus.makeOutbound(allocator, "external", "chat1", "See [IMAGE:/tmp/photo.png]"));
+    var chunk = try bus.makeOutboundChunk(allocator, "external", "chat1", "Hello");
+    chunk.draft_id = 3;
+    try event_bus.publishOutbound(chunk);
+
+    var final = try bus.makeOutbound(allocator, "external", "chat1", "See [IMAGE:/tmp/photo.png]");
+    final.draft_id = 3;
+    try event_bus.publishOutbound(final);
     event_bus.close();
 
     runOutboundDispatcher(allocator, &event_bus, &reg, &stats);
@@ -927,6 +952,155 @@ test "dispatcher falls back to plain final send after deleting tracked draft for
     try std.testing.expectEqual(@as(u64, 0), mock_external.edit_count.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), mock_external.delete_count.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), mock_external.sent_count.load(.monotonic));
+}
+
+test "dispatcher keeps tracked draft isolated from unrelated outbound sends" {
+    const allocator = std.testing.allocator;
+
+    var mock_external = MockDraftChannel{
+        .allocator = allocator,
+        .name_str = "external",
+    };
+    defer mock_external.deinit();
+
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(mock_external.channel());
+
+    var event_bus = bus.Bus.init();
+    var stats = DispatchStats{};
+
+    var chunk = try bus.makeOutboundChunk(allocator, "external", "chat1", "Hello");
+    chunk.draft_id = 41;
+    try event_bus.publishOutbound(chunk);
+
+    try event_bus.publishOutbound(try bus.makeOutbound(allocator, "external", "chat1", "Independent"));
+
+    var final = try bus.makeOutbound(allocator, "external", "chat1", "Done");
+    final.draft_id = 41;
+    try event_bus.publishOutbound(final);
+    event_bus.close();
+
+    runOutboundDispatcher(allocator, &event_bus, &reg, &stats);
+
+    try std.testing.expectEqual(@as(u64, 3), stats.getDispatched());
+    try std.testing.expectEqual(@as(u64, 1), mock_external.tracked_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), mock_external.edit_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), mock_external.delete_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), mock_external.sent_count.load(.monotonic));
+    try std.testing.expectEqualStrings("Done", mock_external.last_edit_text.?);
+}
+
+test "dispatcher clears failed tracked draft state before later sends" {
+    const allocator = std.testing.allocator;
+
+    const FailingDraftChannel = struct {
+        allocator: Allocator,
+        tracked_calls: u32 = 0,
+        sent_count: Atomic(u64) = Atomic(u64).init(0),
+        tracked_count: Atomic(u64) = Atomic(u64).init(0),
+        edit_count: Atomic(u64) = Atomic(u64).init(0),
+        last_tracked_text: ?[]u8 = null,
+        last_edit_text: ?[]u8 = null,
+
+        fn deinit(self: *@This()) void {
+            if (self.last_tracked_text) |text| self.allocator.free(text);
+            if (self.last_edit_text) |text| self.allocator.free(text);
+        }
+
+        const vtable = root.Channel.VTable{
+            .start = mockStart,
+            .stop = mockStop,
+            .send = mockSend,
+            .sendTracked = mockSendTracked,
+            .editMessage = mockEditMessage,
+            .deleteMessage = mockDeleteMessage,
+            .name = mockName,
+            .healthCheck = mockHealthCheck,
+            .supportsTrackedDrafts = mockSupportsTrackedDrafts,
+        };
+
+        fn channel(self: *@This()) root.Channel {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        fn mockStart(_: *anyopaque) anyerror!void {}
+        fn mockStop(_: *anyopaque) void {}
+        fn mockSend(ctx: *anyopaque, _: []const u8, _: []const u8, _: []const []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.sent_count.fetchAdd(1, .monotonic);
+        }
+        fn mockSendTracked(ctx: *anyopaque, target: []const u8, message: []const u8) anyerror!?root.Channel.MessageRef {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.tracked_calls += 1;
+            if (self.tracked_calls == 1) return error.TransientFailure;
+
+            _ = self.tracked_count.fetchAdd(1, .monotonic);
+            if (self.last_tracked_text) |text| self.allocator.free(text);
+            self.last_tracked_text = try self.allocator.dupe(u8, message);
+
+            const target_copy = try self.allocator.dupe(u8, target);
+            errdefer self.allocator.free(target_copy);
+            const id_copy = try self.allocator.dupe(u8, "draft-2");
+            return .{
+                .target = target_copy,
+                .message_id = id_copy,
+            };
+        }
+        fn mockEditMessage(ctx: *anyopaque, edit: root.Channel.MessageEdit) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.edit_count.fetchAdd(1, .monotonic);
+            if (self.last_edit_text) |text| self.allocator.free(text);
+            self.last_edit_text = try self.allocator.dupe(u8, edit.payload.text);
+        }
+        fn mockDeleteMessage(_: *anyopaque, _: root.Channel.MessageRef) anyerror!void {}
+        fn mockName(_: *anyopaque) []const u8 {
+            return "external";
+        }
+        fn mockHealthCheck(_: *anyopaque) bool {
+            return true;
+        }
+        fn mockSupportsTrackedDrafts(_: *anyopaque) bool {
+            return true;
+        }
+    };
+
+    var mock_external = FailingDraftChannel{ .allocator = allocator };
+    defer mock_external.deinit();
+
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(mock_external.channel());
+
+    var event_bus = bus.Bus.init();
+    var stats = DispatchStats{};
+
+    var failed_chunk = try bus.makeOutboundChunk(allocator, "external", "chat1", "Bad");
+    failed_chunk.draft_id = 11;
+    try event_bus.publishOutbound(failed_chunk);
+
+    var fallback_final = try bus.makeOutbound(allocator, "external", "chat1", "Recovered");
+    fallback_final.draft_id = 11;
+    try event_bus.publishOutbound(fallback_final);
+
+    var next_chunk = try bus.makeOutboundChunk(allocator, "external", "chat1", "New");
+    next_chunk.draft_id = 12;
+    try event_bus.publishOutbound(next_chunk);
+
+    var next_final = try bus.makeOutbound(allocator, "external", "chat1", "Complete");
+    next_final.draft_id = 12;
+    try event_bus.publishOutbound(next_final);
+    event_bus.close();
+
+    runOutboundDispatcher(allocator, &event_bus, &reg, &stats);
+
+    try std.testing.expectEqual(@as(u64, 3), stats.getDispatched());
+    try std.testing.expectEqual(@as(u64, 1), stats.getErrors());
+    try std.testing.expectEqual(@as(u64, 1), mock_external.sent_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), mock_external.tracked_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), mock_external.edit_count.load(.monotonic));
+    try std.testing.expectEqualStrings("New", mock_external.last_tracked_text.?);
+    try std.testing.expectEqualStrings("Complete", mock_external.last_edit_text.?);
 }
 
 test "dispatcher ignores tracked draft flow when channel does not advertise it" {

@@ -1565,6 +1565,11 @@ fn isRecoverableCronStoreError(err: anyerror) bool {
 
 const http_util = @import("http_util.zig");
 
+pub const GatewayRequest = union(enum) {
+    unavailable,
+    response: http_util.HttpResponse,
+};
+
 fn trimOwnedRight(allocator: std.mem.Allocator, raw: []u8) ?[]u8 {
     const trimmed = std.mem.trimRight(u8, raw, " \t\r\n");
     if (trimmed.len == raw.len) return raw;
@@ -1620,40 +1625,78 @@ fn buildAuthHeader(allocator: std.mem.Allocator, token: ?[]const u8) ?[]const u8
     return std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{t}) catch null;
 }
 
-/// Issue an HTTP GET to the live gateway and print the JSON response.
-/// Returns true on success (2xx), false if gateway not reachable or non-2xx.
-fn gatewayGet(allocator: std.mem.Allocator, base_url: []const u8, path: []const u8) bool {
+pub fn requestGatewayGet(allocator: std.mem.Allocator, path: []const u8) GatewayRequest {
+    if (builtin.is_test) return .unavailable;
+
+    const base_url = readGatewayUrl(allocator) orelse return .unavailable;
+    defer allocator.free(base_url);
+
     const token = readPairedToken(allocator);
     defer if (token) |t| allocator.free(t);
     const auth_hdr = buildAuthHeader(allocator, token);
     defer if (auth_hdr) |h| allocator.free(h);
 
-    const url = std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, path }) catch return false;
+    const url = std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, path }) catch return .unavailable;
     defer allocator.free(url);
 
     const headers: []const []const u8 = if (auth_hdr) |h| &.{h} else &.{};
-    const resp = http_util.curlGetWithStatusAndTimeout(allocator, url, headers, "5") catch return false;
-    defer allocator.free(resp.body);
-    log.info("{s}", .{resp.body});
-    return resp.status_code >= 200 and resp.status_code < 300;
+    const resp = http_util.curlGetWithStatusAndTimeout(allocator, url, headers, "5") catch return .unavailable;
+    if (resp.status_code == 0) {
+        allocator.free(resp.body);
+        return .unavailable;
+    }
+    return .{ .response = resp };
+}
+
+pub fn requestGatewayPost(allocator: std.mem.Allocator, path: []const u8, json_body: []const u8) GatewayRequest {
+    if (builtin.is_test) return .unavailable;
+
+    const base_url = readGatewayUrl(allocator) orelse return .unavailable;
+    defer allocator.free(base_url);
+
+    const token = readPairedToken(allocator);
+    defer if (token) |t| allocator.free(t);
+    const auth_hdr = buildAuthHeader(allocator, token);
+    defer if (auth_hdr) |h| allocator.free(h);
+
+    const url = std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, path }) catch return .unavailable;
+    defer allocator.free(url);
+
+    const headers: []const []const u8 = if (auth_hdr) |h| &.{h} else &.{};
+    const resp = http_util.curlPostWithStatus(allocator, url, json_body, headers) catch return .unavailable;
+    if (resp.status_code == 0) {
+        allocator.free(resp.body);
+        return .unavailable;
+    }
+    return .{ .response = resp };
+}
+
+/// Issue an HTTP GET to the live gateway and print the JSON response.
+/// Returns true on success (2xx), false if gateway not reachable or non-2xx.
+fn gatewayGet(allocator: std.mem.Allocator, base_url: []const u8, path: []const u8) bool {
+    _ = base_url;
+    switch (requestGatewayGet(allocator, path)) {
+        .unavailable => return false,
+        .response => |resp| {
+            defer allocator.free(resp.body);
+            log.info("{s}", .{resp.body});
+            return resp.status_code >= 200 and resp.status_code < 300;
+        },
+    }
 }
 
 /// Issue an HTTP POST to the live gateway with a JSON body.
 /// Returns true on success (2xx).
 fn gatewayPost(allocator: std.mem.Allocator, base_url: []const u8, path: []const u8, json_body: []const u8) bool {
-    const token = readPairedToken(allocator);
-    defer if (token) |t| allocator.free(t);
-    const auth_hdr = buildAuthHeader(allocator, token);
-    defer if (auth_hdr) |h| allocator.free(h);
-
-    const url = std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, path }) catch return false;
-    defer allocator.free(url);
-
-    const headers: []const []const u8 = if (auth_hdr) |h| &.{h} else &.{};
-    const resp = http_util.curlPostWithStatus(allocator, url, json_body, headers) catch return false;
-    defer allocator.free(resp.body);
-    log.info("{s}", .{resp.body});
-    return resp.status_code >= 200 and resp.status_code < 300;
+    _ = base_url;
+    switch (requestGatewayPost(allocator, path, json_body)) {
+        .unavailable => return false,
+        .response => |resp| {
+            defer allocator.free(resp.body);
+            log.info("{s}", .{resp.body});
+            return resp.status_code >= 200 and resp.status_code < 300;
+        },
+    }
 }
 
 const SchedulerStatus = struct {

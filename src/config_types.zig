@@ -50,6 +50,13 @@ pub const ProviderEntry = struct {
     /// Optional User-Agent header for HTTP requests to this provider.
     /// When set, requests will include "User-Agent: {value}" header.
     user_agent: ?[]const u8 = null,
+    /// Maximum estimated request text bytes before the streaming path is
+    /// skipped and a non-streaming POST is used instead.
+    /// null means no limit — streaming is always attempted (recommended for
+    /// modern LLMs with large context windows).
+    /// When set, 0 forces the non-streaming path for every request and any
+    /// positive value applies that byte threshold. Example: 524288 for 512 KiB.
+    max_streaming_prompt_bytes: ?usize = null,
 };
 
 // ── Audio media config (tools.media.audio) ─────────────────────
@@ -1866,4 +1873,10 @@ test "HttpRequestConfig fallback provider validation disallows auto" {
     try std.testing.expect(HttpRequestConfig.isValidSearchFallbackProviderName("JINA"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchFallbackProviderName("auto"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchFallbackProviderName("AUTO"));
+}
+
+test "ProviderEntry.max_streaming_prompt_bytes defaults to null" {
+    // GAP-5: Documents that zero-init ProviderEntry has no streaming limit.
+    const pe = ProviderEntry{ .name = "test" };
+    try std.testing.expectEqual(@as(?usize, null), pe.max_streaming_prompt_bytes);
 }

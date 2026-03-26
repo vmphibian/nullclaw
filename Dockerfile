@@ -68,7 +68,38 @@ FROM alpine:3.23 AS release-base
 
 LABEL org.opencontainers.image.source=https://github.com/nullclaw/nullclaw
 
-RUN apk add --no-cache ca-certificates curl tzdata
+# Install runtime dependencies: CA certs, utilities, tools, and interpreters
+RUN apk add --no-cache \
+    ca-certificates \
+    curl \
+    tzdata \
+    git \
+    nodejs \
+    python3 \
+    ca-certificates \
+    less \
+    ncurses-terminfo-base \
+    krb5-libs \
+    libgcc \
+    libintl \
+    libssl3 \
+    libstdc++ \
+    userspace-rcu \
+    zlib \
+    icu-libs \
+    openssh-client
+
+# Add lttng-ust from the edge repository for PowerShell dependencies
+RUN apk -X https://dl-cdn.alpinelinux.org/alpine/edge/main add --no-cache \
+    lttng-ust
+
+# Install PowerShell 7.6 LTS
+RUN mkdir -p /opt/microsoft/powershell/7 && \
+    curl -L https://github.com/PowerShell/PowerShell/releases/download/v7.6.0/powershell-7.6.0-linux-musl-x64.tar.gz -o /tmp/powershell.tar.gz && \
+    tar zxf /tmp/powershell.tar.gz -C /opt/microsoft/powershell/7 && \
+    chmod +x /opt/microsoft/powershell/7/pwsh && \
+    ln -s /opt/microsoft/powershell/7/pwsh /usr/bin/pwsh && \
+    rm /tmp/powershell.tar.gz
 
 COPY --from=builder /app/zig-out/bin/nullclaw /usr/local/bin/nullclaw
 COPY --from=config /nullclaw-data /nullclaw-data
@@ -76,6 +107,7 @@ COPY --from=config /nullclaw-data /nullclaw-data
 ENV NULLCLAW_WORKSPACE=/nullclaw-data/workspace
 ENV NULLCLAW_HOME=/nullclaw-data
 ENV HOME=/nullclaw-data
+ENV SHELL=/bin/sh
 ENV NULLCLAW_GATEWAY_PORT=3000
 
 WORKDIR /nullclaw-data
